@@ -13,8 +13,9 @@ def _ah():
 
 def _api(method, path, **kwargs):
     url = f"{API_BASE_URL}{path}"
+    timeout = kwargs.pop("timeout", 120)
     try:
-        resp = getattr(requests, method)(url, headers=_ah(), timeout=60, **kwargs)
+        resp = getattr(requests, method)(url, headers=_ah(), timeout=timeout, **kwargs)
         if resp.status_code == 200:
             return True, resp.json()
         try:
@@ -22,6 +23,8 @@ def _api(method, path, **kwargs):
         except Exception:
             detail = resp.text
         return False, detail
+    except requests.exceptions.ReadTimeout:
+        return False, f"请求超时（{timeout}s）：索引可能仍在后台重建，请稍后刷新列表确认结果"
     except requests.exceptions.ConnectionError:
         return False, "无法连接后端服务"
     except Exception as e:
@@ -65,7 +68,7 @@ def render_knowledge_base():
                 c5.caption(str(f.get("uploaded_at", ""))[:16])
                 confirm_delete = c6.checkbox("按source删", key=f"kf_confirm_{f['id']}")
                 if c7.button("🗑", key=f"kf_del_{f['id']}", use_container_width=True, disabled=not confirm_delete):
-                    ok2, msg = _api("delete", f"/knowledge/{f['id']}")
+                    ok2, msg = _api("delete", f"/knowledge/{f['id']}", timeout=300)
                     if ok2:
                         st.success(
                             f"删除成功！source={f.get('source_name') or '—'}；"
