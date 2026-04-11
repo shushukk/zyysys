@@ -23,6 +23,15 @@ SILICONFLOW_CONFIG = {
     "model": "Qwen/QwQ-32B",
 }
 
+# Neo4j 知识图谱
+NEO4J_CONFIG = {
+    "uri": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+    "user": os.getenv("NEO4J_USER", "neo4j"),
+    "password": os.getenv("NEO4J_PASSWORD", "2941014884sy"),
+}
+ENABLE_KG_RETRIEVAL = os.getenv("ENABLE_KG_RETRIEVAL", "1") == "1"
+KG_TOP_K = int(os.getenv("KG_TOP_K", "3"))
+
 # 检索
 TOP_K = 5
 CHUNK_SIZE = 500

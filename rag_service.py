@@ -8,7 +8,7 @@ import base64
 import json
 from io import BytesIO
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, cast
 
 import numpy as np
 import faiss
@@ -22,7 +22,9 @@ from sqlalchemy.orm import Session as DBSession
 from rag_config import (
     DEVICE, EMBEDDING_MODEL, FAISS_DB_PATH,
     TOP_K, SILICONFLOW_CONFIG, API_TIMEOUT,
+    ENABLE_KG_RETRIEVAL, KG_TOP_K,
 )
+import kg_service
 from database import (
     get_db, create_tables, KnowledgeFile,
     Message, Conversation, User,
@@ -54,9 +56,9 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 
 text_index = None
-knowledge_metadata: List[Dict] = []
+knowledge_metadata: List[Dict[str, Any]] = []
 case_index = None
-case_metadata: List[Dict] = []
+case_metadata: List[Dict[str, Any]] = []
 embed_model = None
 clip_model = None
 yolo_model = None
@@ -125,7 +127,7 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
     return out
 
 
-def retrieve(query_vector: np.ndarray, top_k: int = TOP_K) -> List[Dict]:
+def retrieve(query_vector: np.ndarray, top_k: int = TOP_K) -> List[Dict[str, Any]]:
     if text_index is None:
         return []
     if query_vector.ndim == 1:
@@ -141,7 +143,7 @@ def retrieve(query_vector: np.ndarray, top_k: int = TOP_K) -> List[Dict]:
     return results
 
 
-def retrieve_case_examples(query_vector: np.ndarray, top_k: int = 3) -> List[Dict]:
+def retrieve_case_examples(query_vector: np.ndarray, top_k: int = 3) -> List[Dict[str, Any]]:
     if case_index is None or not case_metadata:
         return []
     if query_vector.ndim == 1:
@@ -157,7 +159,7 @@ def retrieve_case_examples(query_vector: np.ndarray, top_k: int = 3) -> List[Dic
     return results
 
 
-def format_case_examples(cases: List[Dict]) -> str:
+def format_case_examples(cases: List[Dict[str, Any]]) -> str:
     if not cases:
         return ""
 
@@ -230,8 +232,8 @@ def route_question(query: str) -> bool:
 
 def build_prompt(
     query: str,
-    refs: List[Dict],
-    history: List[Dict] = None,
+    refs: List[Dict[str, Any]],
+    history: Optional[List[Dict[str, Any]]] = None,
     few_shot_examples: str = "",
 ) -> str:
     """构建带历史记录的 RAG 提示词（含动态医案 Few-shot 辨证范例）"""
@@ -291,11 +293,19 @@ def build_prompt(
 
 
 
-def build_prompt_knowledge(query: str, refs: List[Dict], history: List[Dict] = None) -> str:
-    """知识查询模式：只基于知识库作答，不使用 Few-shot 问诊推理。"""
-    ctx = "\n\n---\n\n".join([
+def build_prompt_knowledge(query: str, refs: List[Dict[str, Any]], history: Optional[List[Dict[str, Any]]] = None) -> str:
+    """知识查询模式：基于文本检索 + 知识图谱结构事实作答，不使用 Few-shot 问诊推理。"""
+    text_refs = [r for r in refs if r.get("type") != "kg"]
+    kg_refs = [r for r in refs if r.get("type") == "kg"]
+
+    text_ctx = "\n\n---\n\n".join([
         f"【{r.get('source','')} | {r.get('chapter','')} | {r.get('title','')}】\n{r.get('content','')}"
-        for r in refs
+        for r in text_refs
+    ])
+
+    kg_ctx = "\n".join([
+        f"- 【{r.get('source','')} | {r.get('chapter','')} | {r.get('title','')}】{r.get('content','')}"
+        for r in kg_refs
     ])
 
     history_text = ""
@@ -318,15 +328,17 @@ def build_prompt_knowledge(query: str, refs: List[Dict], history: List[Dict] = N
         f"\n\n【作答要求】"
         f"\n1) 这是知识查询模式，不做问诊式四步辨证推理，不使用动态医案示例。"
         f"\n2) 回答应简洁、清晰、结构化，可按定义/功效/主治/应用/注意事项等组织。"
-        f"\n3) 关键结论后尽量标注依据来源。"
-        f"\n\n参考资料（每条以【来源 | 章节 | 标题】标注）：\n{ctx}"
+        f"\n3) 优先使用教材/知识库文本证据回答主体内容；若知识图谱结构事实能补充组成、归经、性味、成分、配伍、禁忌、关联证候/疾病，请融合进回答。"
+        f"\n4) 关键结论后尽量标注依据来源。"
+        f"\n\n【教材与知识库文本证据】\n{text_ctx if text_ctx else '（无）'}"
+        f"\n\n【知识图谱结构事实】\n{kg_ctx if kg_ctx else '（无）'}"
         f"\n\n用户问题：{query}"
         f"\n\n请用中文作答，并在关键结论后用【来源 | 章节 | 标题】标注依据。"
     )
 
 
 
-def build_prompt_general(query: str, history: List[Dict] = None) -> str:
+def build_prompt_general(query: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
     """非中医药问题直接问 LLM 时使用的提示词（含历史）"""
     history_text = ""
     if history:
@@ -349,7 +361,7 @@ def build_prompt_general(query: str, history: List[Dict] = None) -> str:
     )
 
 
-def call_llm(messages: List[Dict], timeout: int = API_TIMEOUT) -> str:
+def call_llm(messages: List[Dict[str, Any]], timeout: int = API_TIMEOUT) -> str:
     client = OpenAI(
         base_url=SILICONFLOW_CONFIG["base_url"],
         api_key=SILICONFLOW_CONFIG["api_key"],
@@ -380,6 +392,16 @@ class QueryResponse(BaseModel):
     dynamic_examples_used: int = 0
 
 
+class GenerationResult(BaseModel):
+    answer: str
+    references: List[Dict[str, Any]]
+    dynamic_examples_used: int = 0
+    effective_query: str
+    query_mode: str
+    is_tcm_related: bool
+    prompt: str
+
+
 class KnowledgeAddRequest(BaseModel):
     file_path:   str
     source_name: Optional[str] = None
@@ -406,6 +428,88 @@ def health():
         "case_index_loaded": case_index is not None,
         "case_examples_count": len(case_metadata),
     }
+
+
+def generate_answer(
+    text_query: str,
+    query_mode: str = "diagnosis",
+    top_k: Optional[int] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+    image_array: Optional[np.ndarray] = None,
+) -> GenerationResult:
+    top_k = top_k or TOP_K
+    history = history or []
+
+    effective_query = augment_query_with_image(text_query.strip(), image_array)
+    if not effective_query.strip():
+        raise ValueError("请输入问题或上传图片")
+
+    query_mode = (query_mode or "diagnosis").strip().lower()
+    if query_mode not in {"knowledge", "diagnosis"}:
+        query_mode = "diagnosis"
+
+    is_tcm_related = True if query_mode == "knowledge" else route_question(effective_query)
+    refs_clean: List[Dict[str, Any]] = []
+    dynamic_examples_used = 0
+
+    if is_tcm_related:
+        query_vector = encode_text_bge(effective_query)
+        refs = retrieve(query_vector, top_k=top_k)
+
+        # knowledge 模式下接入 Neo4j 知识图谱混合检索
+        if query_mode == "knowledge" and ENABLE_KG_RETRIEVAL:
+            try:
+                kg_refs = kg_service.kg_retrieve(text_query.strip() or effective_query, top_k=KG_TOP_K)
+                print(f"[KG] 已追加 {len(kg_refs)} 条图谱事实到 knowledge refs")
+                refs = refs + kg_refs
+            except Exception as e:
+                print(f"KG 检索失败: {e}")
+
+        refs_clean = [
+            {
+                "content": r.get("content", "")[:800],
+                "source": r.get("source", ""),
+                "chapter": r.get("chapter", ""),
+                "title": r.get("title", ""),
+                "type": r.get("type", ""),
+                "score": r.get("score"),
+            }
+            for r in refs
+        ]
+
+        if query_mode == "knowledge":
+            prompt = build_prompt_knowledge(
+                text_query.strip() or effective_query,
+                refs_clean,
+                history=history,
+            )
+        else:
+            example_top_k = 4 if len(effective_query) >= 80 else 3 if len(effective_query) >= 30 else 2
+            matched_cases = retrieve_case_examples(query_vector, top_k=example_top_k)
+            dynamic_examples_used = len(matched_cases)
+            dynamic_case_examples = format_case_examples(matched_cases)
+            prompt = build_prompt(
+                text_query.strip() or effective_query,
+                refs_clean,
+                history=history,
+                few_shot_examples=dynamic_case_examples,
+            )
+    else:
+        prompt = build_prompt_general(
+            text_query.strip() or effective_query,
+            history=history,
+        )
+
+    answer = call_llm([{"role": "user", "content": prompt}])
+    return GenerationResult(
+        answer=cast(str, answer),
+        references=refs_clean,
+        dynamic_examples_used=dynamic_examples_used,
+        effective_query=effective_query,
+        query_mode=query_mode,
+        is_tcm_related=is_tcm_related,
+        prompt=prompt,
+    )
 
 
 # ── 匿名查询接口（兼容旧版） ───────────────────────────────
@@ -445,10 +549,6 @@ def _do_query(
         img         = Image.open(BytesIO(raw)).convert("RGB")
         image_array = np.array(img)
 
-    effective_query = augment_query_with_image(text_query, image_array)
-    if not effective_query.strip():
-        raise HTTPException(status_code=400, detail="请输入问题或上传图片")
-
     # ── 加载历史消息（登录用户 + 指定会话） ──────────────
     history: List[Dict] = []
     conv = None
@@ -468,61 +568,16 @@ def _do_query(
             for m in past_msgs[-20:]:
                 history.append({"role": m.role, "content": m.content})
 
-    # ── 问题路由：判断是否与中医药相关 ────────────────────
-    query_mode = (request.query_mode or "diagnosis").strip().lower()
-    if query_mode not in {"knowledge", "diagnosis"}:
-        query_mode = "diagnosis"
-    is_tcm_related = True if query_mode == "knowledge" else route_question(effective_query)
-
-    refs_clean: List[Dict] = []
-    dynamic_examples_used = 0
-
-    if is_tcm_related:
-        # ── 中医药 RAG 流程 ──────────────────────────────
-        try:
-            query_vector = encode_text_bge(effective_query)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        refs = retrieve(query_vector, top_k=top_k)
-        refs_clean = [
-            {
-                "content": r.get("content", "")[:280],
-                "source":  r.get("source",  ""),
-                "chapter": r.get("chapter", ""),
-                "title":   r.get("title",   ""),
-                "type":    r.get("type",    ""),
-                "score":   r.get("score"),
-            }
-            for r in refs
-        ]
-
-        if query_mode == "knowledge":
-            prompt = build_prompt_knowledge(
-                request.message.strip() or effective_query,
-                refs_clean,
-                history=history,
-            )
-        else:
-            example_top_k = 4 if len(effective_query) >= 80 else 3 if len(effective_query) >= 30 else 2
-            matched_cases = retrieve_case_examples(query_vector, top_k=example_top_k)
-            dynamic_examples_used = len(matched_cases)
-            dynamic_case_examples = format_case_examples(matched_cases)
-            prompt = build_prompt(
-                request.message.strip() or effective_query,
-                refs_clean,
-                history=history,
-                few_shot_examples=dynamic_case_examples,
-            )
-    else:
-        # ── 非中医药问题：直接问 LLM，不做向量检索 ────────
-        prompt = build_prompt_general(
-            request.message.strip() or effective_query,
-            history=history,
-        )
-
     try:
-        answer = call_llm([{"role": "user", "content": prompt}])
+        result = generate_answer(
+            text_query=text_query,
+            query_mode=request.query_mode,
+            top_k=top_k,
+            history=history,
+            image_array=image_array,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
 
@@ -543,18 +598,18 @@ def _do_query(
         db.add(Message(
             conversation_id=conv.id,
             role="assistant",
-            content=answer,
-            references_json=json.dumps(refs_clean, ensure_ascii=False) if refs_clean else None,
+            content=result.answer,
+            references_json=json.dumps(result.references, ensure_ascii=False) if result.references else None,
         ))
         conv.updated_at = datetime.utcnow()
         db.commit()
         conv_id = conv.id
 
     return QueryResponse(
-        answer=answer,
+        answer=result.answer,
         conversation_id=conv_id,
-        references=refs_clean,
-        dynamic_examples_used=dynamic_examples_used,
+        references=result.references,
+        dynamic_examples_used=result.dynamic_examples_used,
     )
 
 
@@ -911,4 +966,3 @@ def delete_knowledge(
     }
 
 
-# 
