@@ -40,7 +40,7 @@ SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 SILICONFLOW_API_KEY = "sk-ozlzuinpyxuqslsusdqqvfabglqsetnclvgogptawtwvfuun"
 SILICONFLOW_MODEL = "Pro/Qwen/Qwen2.5-7B-Instruct"
 EMBEDDING_MODEL_PATH = r"C:\Users\86182\bge-small-zh-v1.5"
-META_FIELDS = ["query_mode", "top_k"]
+META_FIELDS = ["query_mode", "top_k", "kg_context_count", "text_context_count"]
 
 # ============================================================
 # 不同模式使用不同评测口径

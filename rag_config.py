@@ -31,6 +31,8 @@ NEO4J_CONFIG = {
 }
 ENABLE_KG_RETRIEVAL = os.getenv("ENABLE_KG_RETRIEVAL", "1") == "1"
 KG_TOP_K = int(os.getenv("KG_TOP_K", "3"))
+# diagnosis 模式：证候候选召回数量
+KG_SYNDROME_TOP_K = int(os.getenv("KG_SYNDROME_TOP_K", "3"))
 
 # 检索
 TOP_K = 5

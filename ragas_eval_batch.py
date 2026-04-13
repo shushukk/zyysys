@@ -37,17 +37,37 @@ print("[初始化] 完成\n")
 # 单条处理
 # ============================================================
 def _build_eval_contexts(result: rag_service.GenerationResult) -> List[str]:
+    """将线上检索到的 references 组装为 ragas 的 contexts。
+
+    最小改动支持：知识图谱（KG/Neo4j）证据也进入 contexts。
+    约定：rag_service.generate_answer() 产出的 references 中，若 r['type']=='kg'，其 r['content'] 为图谱事实的可读文本。
+    """
     contexts: List[str] = []
 
     for r in result.references:
-        content = r.get("content", "").strip()
-        if content:
+        content = (r.get("content") or "").strip()
+        if not content:
+            continue
+
+        # KG 证据：独立打标，避免与教材 chunk 混在一起
+        if r.get("type") == "kg":
             source_tag = " | ".join(filter(None, [
+                "KG",
                 r.get("source", ""),
-                r.get("breadcrumb", "") or r.get("chapter", ""),
                 r.get("title", ""),
+                r.get("chapter", ""),
+                r.get("predicate", ""),
             ]))
-            contexts.append(f"[{source_tag}] {content}" if source_tag else content)
+            contexts.append(f"[{source_tag}] {content}" if source_tag else f"[KG] {content}")
+            continue
+
+        # 文本知识库 chunk
+        source_tag = " | ".join(filter(None, [
+            r.get("source", ""),
+            r.get("breadcrumb", "") or r.get("chapter", ""),
+            r.get("title", ""),
+        ]))
+        contexts.append(f"[{source_tag}] {content}" if source_tag else content)
 
     # diagnosis 模式下，线上答案还会使用动态医案示例，因此评测时也把它补进 contexts
     if result.query_mode == "diagnosis" and result.dynamic_examples_used > 0:
@@ -115,18 +135,26 @@ def run_single(
             "query_mode": query_mode,
             "top_k": top_k,
             "dynamic_examples_used": 0,
+            "kg_context_count": 0,
+            "text_context_count": 0,
         }
         if ground_truth is not None:
             record["ground_truth"] = ground_truth
         return record
 
+    contexts = _build_eval_contexts(result)
+    kg_ctx_count = sum(1 for c in contexts if str(c).lstrip().startswith("[KG"))
+    text_ctx_count = len(contexts) - kg_ctx_count
+
     record = {
         "question": question,
-        "contexts": _build_eval_contexts(result),
+        "contexts": contexts,
         "answer": result.answer,
         "query_mode": result.query_mode,
         "top_k": top_k,
         "dynamic_examples_used": result.dynamic_examples_used,
+        "kg_context_count": kg_ctx_count,
+        "text_context_count": text_ctx_count,
     }
     if ground_truth is not None:
         record["ground_truth"] = ground_truth

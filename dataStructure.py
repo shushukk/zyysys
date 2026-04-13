@@ -21,6 +21,8 @@ from docx import Document
 from pptx import Presentation
 from tqdm import tqdm
 
+from rag_config import DEVICE
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ def _extract_pdf_text(pdf_path: str) -> str:
     if ocr_needed:
         logger.info(f"{len(ocr_needed)} 页无文字层，使用EasyOCR")
         import easyocr
-        reader = easyocr.Reader(["ch_sim", "en"], gpu=True)
+        reader = easyocr.Reader(["ch_sim", "en"], gpu=(DEVICE == "cuda"))
         matrix = fitz.Matrix(300 / 72, 300 / 72)
         for i in ocr_needed:
             page = doc[i]
@@ -127,6 +129,10 @@ def extract_text(file_path: str) -> str:
         return _extract_docx_text(file_path)
     elif ext == '.pptx':
         return _extract_pptx_text(file_path)
+    elif ext == '.csv':
+        # 每行一条，逗号分隔原样保留
+        with open(file_path, encoding='utf-8') as f:
+            return f.read()
     elif ext in ('.txt', '.md'):
         with open(file_path, encoding='utf-8') as f:
             return f.read()

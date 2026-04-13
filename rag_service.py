@@ -6,6 +6,8 @@ uvicorn rag_service:app --host 0.0.0.0 --port 8000 --reload
 import os
 import base64
 import json
+import re
+import logging
 from io import BytesIO
 from datetime import datetime
 from typing import List, Dict, Any, Optional, cast
@@ -22,9 +24,10 @@ from sqlalchemy.orm import Session as DBSession
 from rag_config import (
     DEVICE, EMBEDDING_MODEL, FAISS_DB_PATH,
     TOP_K, SILICONFLOW_CONFIG, API_TIMEOUT,
-    ENABLE_KG_RETRIEVAL, KG_TOP_K,
+    ENABLE_KG_RETRIEVAL, KG_TOP_K, KG_SYNDROME_TOP_K,
 )
 import kg_service
+import dataStructure
 from database import (
     get_db, create_tables, KnowledgeFile,
     Message, Conversation, User,
@@ -38,6 +41,14 @@ from auth_service import (
     create_default_admin,
 )
 from db_config import API_BASE_URL
+
+# ===================== 日志（用于定位入库/分片问题） =====================
+logger = logging.getLogger("rag")
+if not logger.handlers:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
 # ===================== 全局模型 =====================
 
@@ -55,6 +66,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(admin_router)
 
+# 全局索引与元数据（文本知识库支持分片）
 text_index = None
 knowledge_metadata: List[Dict[str, Any]] = []
 case_index = None
@@ -64,24 +76,182 @@ clip_model = None
 yolo_model = None
 ocr_reader = None
 
+# ── 知识库分片（按数量/大小自动扩容） ─────────────────────
+# 目标：避免 metadata.json 单文件无限变大；最小改动：
+# - 仍然使用 FAISS + JSON 元数据
+# - 将文本知识库拆成多个 shard 目录：faiss_index/text_shards/shard_00001/...
+# - 写入时自动选择可用 shard；查询时遍历所有 shard 合并 topK
+
+TEXT_SHARDS_DIR = os.path.join(FAISS_DB_PATH, "text_shards")
+TEXT_SHARD_PREFIX = "shard_"
+# 单个 shard 最大条目数（knowledge_metadata 的条目数）。5000～20000 都行，先保守点。
+TEXT_SHARD_MAX_ITEMS = int(os.getenv("TEXT_SHARD_MAX_ITEMS", "5000"))
+
+
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def _list_text_shard_dirs() -> List[str]:
+    """返回所有 shard 目录绝对路径（按编号升序）。"""
+    if not os.path.exists(TEXT_SHARDS_DIR):
+        return []
+    names = [n for n in os.listdir(TEXT_SHARDS_DIR) if n.startswith(TEXT_SHARD_PREFIX)]
+
+    def _num(n: str) -> int:
+        m = re.search(r"(\d+)$", n)
+        return int(m.group(1)) if m else 0
+
+    names.sort(key=_num)
+    return [os.path.join(TEXT_SHARDS_DIR, n) for n in names]
+
+
+def _make_text_shard_dir(shard_no: int) -> str:
+    _ensure_dir(TEXT_SHARDS_DIR)
+    name = f"{TEXT_SHARD_PREFIX}{shard_no:05d}"
+    p = os.path.join(TEXT_SHARDS_DIR, name)
+    _ensure_dir(p)
+    return p
+
+
+def _text_shard_paths(shard_dir: str) -> Dict[str, str]:
+    return {
+        "index": os.path.join(shard_dir, "faiss_text.index"),
+        "meta": os.path.join(shard_dir, "metadata.json"),
+    }
+
+
+def _load_text_metadata(meta_path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(meta_path):
+        return []
+    with open(meta_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else []
+
+
+def _choose_writable_text_shard(min_new_items: int) -> str:
+    """选择一个可写 shard：优先最后一个，不够则新建。"""
+    shard_dirs = _list_text_shard_dirs()
+    if not shard_dirs:
+        return _make_text_shard_dir(1)
+
+    last = shard_dirs[-1]
+    paths = _text_shard_paths(last)
+    items = _load_text_metadata(paths["meta"])
+    if len(items) + min_new_items <= TEXT_SHARD_MAX_ITEMS:
+        return last
+
+    # 新建 shard
+    # last name 形如 shard_00001
+    m = re.search(r"(\d+)$", os.path.basename(last))
+    next_no = int(m.group(1)) + 1 if m else (len(shard_dirs) + 1)
+    return _make_text_shard_dir(next_no)
+
+
+def _rebuild_text_index_for_shard(shard_dir: str) -> None:
+    """根据 shard 内 metadata.json 重建该 shard 的 faiss_text.index。"""
+    paths = _text_shard_paths(shard_dir)
+    meta = _load_text_metadata(paths["meta"])
+
+    text_items = [m for m in meta if m.get("content", "").strip()]
+    if not text_items:
+        # 清空 shard
+        if os.path.exists(paths["index"]):
+            os.remove(paths["index"])
+        with open(paths["meta"], "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        return
+
+    vectors = [encode_text_bge(item["content"]) for item in text_items]
+    matrix = np.vstack(vectors).astype("float32")
+    faiss.normalize_L2(matrix)
+    dim = matrix.shape[1]
+    idx = faiss.IndexFlatIP(dim)
+    idx.add(matrix)
+    faiss.write_index(idx, paths["index"])
+    with open(paths["meta"], "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+
+
+def _append_text_items_to_shard(shard_dir: str, new_items: List[Dict[str, Any]]) -> None:
+    paths = _text_shard_paths(shard_dir)
+    meta = _load_text_metadata(paths["meta"])
+    meta.extend(new_items)
+    with open(paths["meta"], "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    _rebuild_text_index_for_shard(shard_dir)
+
+
+def _retrieve_from_text_shards(query_vector: np.ndarray, top_k: int) -> List[Dict[str, Any]]:
+    """遍历所有 shard 合并 topK。"""
+    shard_dirs = _list_text_shard_dirs()
+
+    # 兼容：如果还没分片，就沿用旧的单库模式
+    if not shard_dirs:
+        if text_index is None:
+            return []
+        D, I = text_index.search(query_vector, min(top_k, text_index.ntotal))
+        out: List[Dict[str, Any]] = []
+        for score, idx in zip(D[0], I[0]):
+            if idx < 0 or idx >= len(knowledge_metadata):
+                continue
+            m = knowledge_metadata[idx]
+            out.append({**m, "score": float(score)})
+        return out
+
+    merged: List[Dict[str, Any]] = []
+    for shard_dir in shard_dirs:
+        paths = _text_shard_paths(shard_dir)
+        if not (os.path.exists(paths["index"]) and os.path.exists(paths["meta"])):
+            continue
+        try:
+            idx = faiss.read_index(paths["index"])
+            meta = _load_text_metadata(paths["meta"])
+            if idx.ntotal <= 0 or not meta:
+                continue
+            D, I = idx.search(query_vector, min(top_k, idx.ntotal))
+            for score, hit in zip(D[0], I[0]):
+                if hit < 0 or hit >= len(meta):
+                    continue
+                m = meta[hit]
+                merged.append({**m, "score": float(score)})
+        except Exception:
+            # shard 读失败不影响整体查询
+            continue
+
+    merged.sort(key=lambda x: (x.get("score") or 0.0), reverse=True)
+    return merged[:top_k]
+
+
 
 def init_models():
     global text_index, knowledge_metadata, case_index, case_metadata, embed_model
     if embed_model is None:
         print("加载嵌入模型...")
         embed_model = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
-    index_path = os.path.join(FAISS_DB_PATH, "faiss_text.index")
-    meta_path  = os.path.join(FAISS_DB_PATH, "metadata.json")
+
+    # 1) 优先使用分片知识库
+    _ensure_dir(TEXT_SHARDS_DIR)
+    shard_dirs = _list_text_shard_dirs()
+    if shard_dirs:
+        print(f"检测到文本知识库分片: {len(shard_dirs)} 个，将按分片检索")
+        text_index = None
+        knowledge_metadata = []
+    else:
+        # 2) 兼容旧版单库
+        index_path = os.path.join(FAISS_DB_PATH, "faiss_text.index")
+        meta_path  = os.path.join(FAISS_DB_PATH, "metadata.json")
+        if os.path.exists(index_path) and os.path.exists(meta_path):
+            text_index = faiss.read_index(index_path)
+            with open(meta_path, "r", encoding="utf-8") as f:
+                knowledge_metadata = json.load(f)
+            print("已加载 FAISS 文本索引")
+        else:
+            print("FAISS 索引不存在，请先运行 build_knowledge_base.py")
+
+    # 医案 Few-shot 索引仍沿用单库
     case_index_path = os.path.join(FAISS_DB_PATH, "faiss_case.index")
     case_meta_path = os.path.join(FAISS_DB_PATH, "case_metadata.json")
-    if os.path.exists(index_path) and os.path.exists(meta_path):
-        text_index = faiss.read_index(index_path)
-        with open(meta_path, "r", encoding="utf-8") as f:
-            knowledge_metadata = json.load(f)
-        print("已加载 FAISS 文本索引")
-    else:
-        print("FAISS 索引不存在，请先运行 build_knowledge_base.py")
-
     if os.path.exists(case_index_path) and os.path.exists(case_meta_path):
         case_index = faiss.read_index(case_index_path)
         with open(case_meta_path, "r", encoding="utf-8") as f:
@@ -91,18 +261,32 @@ def init_models():
 
 def _load_multimodal():
     global clip_model, yolo_model, ocr_reader
-    if clip_model is not None:
-        return
-    try:
-        import clip
-        clip_model, _ = clip.load("ViT-B/32", device=DEVICE)
-        from ultralytics import YOLO
-        yolo_model = YOLO("yolov8m.pt")
-        import easyocr
-        ocr_reader = easyocr.Reader(["ch_sim", "en"], gpu=(DEVICE == "cuda"))
-        print("多模态模型已加载")
-    except Exception as e:
-        print(f"多模态模型加载失败: {e}")
+
+    # OCR 对知识入库很关键；即便其他模型加载失败，也要尽量保证 OCR 可用。
+    if ocr_reader is None:
+        try:
+            import easyocr
+            ocr_reader = easyocr.Reader(["ch_sim", "en"], gpu=(DEVICE == "cuda"))
+            print("OCR 模型已加载")
+        except Exception as e:
+            print(f"OCR 模型加载失败: {e}")
+
+    # 其他多模态模型（用于图片增强检索）；失败不影响主流程
+    if clip_model is None:
+        try:
+            import clip
+            clip_model, _ = clip.load("ViT-B/32", device=DEVICE)
+            print("CLIP 模型已加载")
+        except Exception as e:
+            print(f"CLIP 模型加载失败: {e}")
+
+    if yolo_model is None:
+        try:
+            from ultralytics import YOLO
+            yolo_model = YOLO("yolov8m.pt")
+            print("YOLO 模型已加载")
+        except Exception as e:
+            print(f"YOLO 模型加载失败: {e}")
 
 
 def encode_text_bge(text: str) -> np.ndarray:
@@ -128,19 +312,10 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
 
 
 def retrieve(query_vector: np.ndarray, top_k: int = TOP_K) -> List[Dict[str, Any]]:
-    if text_index is None:
-        return []
     if query_vector.ndim == 1:
         query_vector = query_vector.reshape(1, -1)
     faiss.normalize_L2(query_vector)
-    D, I = text_index.search(query_vector, min(top_k, text_index.ntotal))
-    results = []
-    for dist, idx in zip(D[0], I[0]):
-        if 0 <= idx < len(knowledge_metadata):
-            meta = knowledge_metadata[idx].copy()
-            meta["score"] = float(dist)
-            results.append(meta)
-    return results
+    return _retrieve_from_text_shards(query_vector, top_k)
 
 
 def retrieve_case_examples(query_vector: np.ndarray, top_k: int = 3) -> List[Dict[str, Any]]:
@@ -235,6 +410,7 @@ def build_prompt(
     refs: List[Dict[str, Any]],
     history: Optional[List[Dict[str, Any]]] = None,
     few_shot_examples: str = "",
+    syndrome_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """构建带历史记录的 RAG 提示词（含动态医案 Few-shot 辨证范例）"""
     ctx = "\n\n---\n\n".join([
@@ -274,11 +450,29 @@ def build_prompt(
 - 解释总结：本病关键在“木郁乘土”，非单纯胃虚寒。治宜疏肝理气、和胃降逆。
 """.strip()
 
+    syndrome_hint = ""
+    if syndrome_candidates:
+        lines = []
+        for i, c in enumerate(syndrome_candidates[:5], 1):
+            syn = c.get("syndrome") or ""
+            hits = c.get("hits") or []
+            score = c.get("score")
+            hits_text = "、".join([h for h in hits if h])
+            score_text = f"，命中{score}项" if score is not None else ""
+            lines.append(f"{i}. {syn}{score_text}（{hits_text}）" if hits_text else f"{i}. {syn}{score_text}")
+        if lines:
+            syndrome_hint = (
+                "\n\n【知识图谱证候候选召回（辅助提示）】\n"
+                "以下候选仅用于引导辨证（可能存在噪声），请结合参考资料与四步推理进行鉴别：\n"
+                + "\n".join(lines)
+            )
+
     return (
         f"你是中医辨证论治专家助手。请严格依据‘参考资料’回答问题，优先使用资料中的证据，不要编造来源。"
         f"若资料不足，先明确说明‘资料未直接覆盖’，再给出基于中医理论的审慎推断。"
         f"{history_section}"
         f"\n\n你需要模仿以下专家范例的推理方式（Few-shot）：\n{few_shot_examples}"
+        f"{syndrome_hint}"
         f"\n\n【作答方法要求】"
         f"\n1) 对辨证类问题，按四步输出：信息提取 -> 病机推理 -> 证候推理 -> 解释总结。"
         f"\n2) 信息提取仅保留与辨证直接相关的症状、舌脉、病程。"
@@ -488,11 +682,27 @@ def generate_answer(
             matched_cases = retrieve_case_examples(query_vector, top_k=example_top_k)
             dynamic_examples_used = len(matched_cases)
             dynamic_case_examples = format_case_examples(matched_cases)
+
+            syndrome_candidates = []
+            try:
+                # 先用图谱实体词表从长文本里做字典匹配抽取（更适配问诊长句）
+                extracted = kg_service.extract_features_from_text(text_query, max_hits=15)
+                # 兜底：若抽取为空，再用分隔符切词
+                features = extracted or [x.strip() for x in re.split(r"[\s,，;；、\n\t]+", text_query) if x.strip()]
+                print(f"[KG] features_extracted={len(extracted)} features_used={len(features)}")
+                if extracted:
+                    print(f"[KG] extracted={extracted}")
+                syndrome_candidates = kg_service.syndrome_candidates(features, top_k=KG_SYNDROME_TOP_K)
+                print(f"[KG] 证候候选召回返回 {len(syndrome_candidates)} 条")
+            except Exception as e:
+                print(f"[KG] 证候候选召回失败: {e}")
+
             prompt = build_prompt(
                 text_query.strip() or effective_query,
                 refs_clean,
                 history=history,
                 few_shot_examples=dynamic_case_examples,
+                syndrome_candidates=syndrome_candidates,
             )
     else:
         prompt = build_prompt_general(
@@ -677,6 +887,8 @@ def _ingest_knowledge_file(
     global text_index, knowledge_metadata, case_index, case_metadata
 
     ext = os.path.splitext(file_path)[1].lower()
+    logger.info("[KB] ingest start: file_path=%s source=%s ext=%s user_id=%s", file_path, source_name, ext, getattr(current_user, "id", None))
+
     kf = KnowledgeFile(
         filename=os.path.basename(file_path),
         source_name=source_name,
@@ -688,16 +900,13 @@ def _ingest_knowledge_file(
     db.add(kf)
     db.flush()
 
-    from langchain_community.document_loaders import (
-        PyPDFLoader, Docx2txtLoader, TextLoader, CSVLoader
-    )
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-
     case_count_added = 0
+
+    # langchain loader/splitter 已弃用：统一走 dataStructure.process_file()
+
     if ext == ".json":
         cases = _extract_cases_from_json(file_path)
+        logger.info("[KB] json cases parsed=%d", len(cases))
         chunks = []
 
         case_vectors = []
@@ -729,49 +938,97 @@ def _ingest_knowledge_file(
             faiss.write_index(case_index, os.path.join(FAISS_DB_PATH, "faiss_case.index"))
             with open(os.path.join(FAISS_DB_PATH, "case_metadata.json"), "w", encoding="utf-8") as f:
                 json.dump(case_metadata, f, ensure_ascii=False)
-    else:
-        loaders = {
-            ".pdf":  PyPDFLoader,
-            ".docx": Docx2txtLoader,
-            ".txt":  TextLoader,
-            ".csv":  CSVLoader,
+
+        # JSON 医案只更新 case_index，不进入文本知识库分片
+        kf.chunks_added = 0
+        db.commit()
+        return {
+            "file": file_path,
+            "chunks_added": 0,
+            "case_examples_added": case_count_added,
+            "total_index_size": 0,
+            "total_case_examples": len(case_metadata),
         }
-        loader_cls = loaders.get(ext)
-        if loader_cls is None:
-            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
-        if ext == ".txt":
-            loader = loader_cls(file_path, encoding="utf-8", autodetect_encoding=True)
-        elif ext == ".csv":
-            loader = loader_cls(file_path, encoding="utf-8")
-        else:
-            loader = loader_cls(file_path)
-        docs = loader.load()
-        chunks = splitter.split_documents(docs)
 
-    new_vectors = []
-    for i, chunk in enumerate(chunks):
-        vec = encode_text_bge(chunk.page_content)
-        new_vectors.append(vec)
-        knowledge_metadata.append({
-            "content":  chunk.page_content,
-            "source":   source_name,
-            "chapter":  "",
-            "title":    f"chunk_{i}",
-            "type":     ext.lstrip("."),
-        })
+    # 文本类知识库：统一用 dataStructure.process_file() 做提取 + 分块（内置 PDF OCR 兜底）
+    if ext in {".pdf", ".docx", ".txt", ".csv"}:
+        try:
+            ds_chunks = dataStructure.process_file(file_path, source_name=source_name)
+            logger.info("[KB] dataStructure chunks=%d", len(ds_chunks))
+        except Exception as e:
+            logger.exception("[KB] dataStructure.process_file failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"分块失败: {e}")
 
-    if new_vectors:
-        matrix = np.vstack(new_vectors).astype("float32")
-        faiss.normalize_L2(matrix)
-        if text_index is None:
-            dim = matrix.shape[1]
-            text_index = faiss.IndexFlatIP(dim)
-        text_index.add(matrix)
+        # 直接转换为入库条目，保留教材分块元数据（breadcrumb/heading/level/chunk_id/file_path）
+        chunks = []
+        new_items: List[Dict[str, Any]] = []
+        for i, c in enumerate(ds_chunks):
+            txt = (c.get("text") or "").strip()
+            if not txt:
+                continue
+            meta = c.get("metadata") or {}
+            breadcrumb = (meta.get("breadcrumb") or "").strip()
+            heading = (meta.get("heading") or "").strip()
+            level = meta.get("level", -1)
 
-        # 持久化
-        faiss.write_index(text_index, os.path.join(FAISS_DB_PATH, "faiss_text.index"))
-        with open(os.path.join(FAISS_DB_PATH, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(knowledge_metadata, f, ensure_ascii=False)
+            new_items.append({
+                "content": txt,
+                "source": (meta.get("source") or source_name),
+                "chapter": breadcrumb,           # 你要求：存完整 breadcrumb
+                "type": "章节",                  # 你要求：固定写 "章节"
+                "title": heading or f"chunk_{i}",
+                "chunk_id": c.get("chunk_id", ""),
+                "file_path": c.get("file_path", file_path),
+                "level": level,
+                "breadcrumb": breadcrumb,
+            })
+
+        # 兼容下面返回值的 chunks_added 统计
+        chunks = [type("_DSDoc", (), {"page_content": it["content"]})() for it in new_items]
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+
+    total = text_index.ntotal if text_index else 0
+
+    # 文本类知识库：new_items 已在上面构造（保留教材分块元数据）
+
+    # —— 文本知识库写入：分片优先（按数量自动扩容）；若没有分片则兼容旧版单库 ——
+    if new_items:
+        logger.info("[KB] text items=%d, TEXT_SHARD_MAX_ITEMS=%d", len(new_items), TEXT_SHARD_MAX_ITEMS)
+        # 统一走“选择可写 shard”逻辑：
+        # - 如果没有任何 shard，则自动创建 shard_00001
+        # - 若最后一个 shard 超过上限，则自动创建 shard_00002...
+        remaining_items = list(new_items)
+        while remaining_items:
+            shard_dir = _choose_writable_text_shard(min_new_items=1)
+            paths = _text_shard_paths(shard_dir)
+            meta = _load_text_metadata(paths["meta"])
+            capacity = max(TEXT_SHARD_MAX_ITEMS - len(meta), 0)
+            logger.info("[KB] choose shard=%s meta_len=%d capacity=%d remaining=%d", os.path.basename(shard_dir), len(meta), capacity, len(remaining_items))
+            if capacity <= 0:
+                # 最后一个 shard 已满（或历史迁移导致已超限），直接创建下一个 shard
+                shard_dirs = _list_text_shard_dirs()
+                last_name = os.path.basename(shard_dirs[-1]) if shard_dirs else f"{TEXT_SHARD_PREFIX}00000"
+                m = re.search(r"(\d+)$", last_name)
+                next_no = int(m.group(1)) + 1 if m else (len(shard_dirs) + 1)
+                shard_dir = _make_text_shard_dir(next_no)
+                paths = _text_shard_paths(shard_dir)
+                meta = _load_text_metadata(paths["meta"])
+                capacity = max(TEXT_SHARD_MAX_ITEMS - len(meta), 0)
+                logger.info("[KB] shard full -> created shard=%s meta_len=%d capacity=%d", os.path.basename(shard_dir), len(meta), capacity)
+
+            batch = remaining_items[:capacity] if capacity > 0 else remaining_items
+            remaining_items = remaining_items[len(batch):]
+            logger.info("[KB] append shard=%s batch=%d remaining_after=%d", os.path.basename(shard_dir), len(batch), len(remaining_items))
+            _append_text_items_to_shard(shard_dir, batch)
+
+        # 返回统计用的 total_index_size = 所有 shard 的条目总数
+        total = 0
+        for sd in _list_text_shard_dirs():
+            p = _text_shard_paths(sd)
+            if os.path.exists(p["meta"]):
+                total += len(_load_text_metadata(p["meta"]))
+
 
     kf.chunks_added = len(chunks)
     db.commit()
@@ -780,7 +1037,7 @@ def _ingest_knowledge_file(
         "file": file_path,
         "chunks_added": len(chunks),
         "case_examples_added": case_count_added,
-        "total_index_size": text_index.ntotal if text_index else 0,
+        "total_index_size": total,
         "total_case_examples": len(case_metadata),
     }
 
@@ -829,7 +1086,7 @@ def upload_knowledge(
         with open(temp_path, "wb") as f:
             f.write(file.file.read())
 
-        final_source = source_name or file.filename or os.path.basename(temp_path)
+        final_source = source_name or file.filename or os.path.basename(file.filename or temp_path)
         return _ingest_knowledge_file(temp_path, final_source, current_user, db)
     except HTTPException:
         raise
@@ -847,8 +1104,16 @@ def upload_knowledge(
 def list_knowledge(
     current_user: User    = Depends(get_current_admin),
     db: DBSession         = Depends(get_db),
+    limit: int = 2000,
+    offset: int = 0,
 ):
-    files = db.query(KnowledgeFile).order_by(KnowledgeFile.uploaded_at.desc()).all()
+    files = (
+        db.query(KnowledgeFile)
+        .order_by(KnowledgeFile.uploaded_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
     return [
         {
             "id":           f.id,
